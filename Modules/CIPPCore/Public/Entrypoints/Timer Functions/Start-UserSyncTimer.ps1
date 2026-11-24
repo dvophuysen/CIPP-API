@@ -20,25 +20,49 @@ function Start-UserSyncTimer {
     $ApiName = 'UserSync'
 
     try {
-        Write-LogMessage -API $ApiName -tenant 'none' -message 'Starting user sync from partner tenant.' -sev Info
-
         # Load the role-to-group mappings
         $AccessGroupsTable = Get-CippTable -TableName AccessRoleGroups
         $AccessGroups = @(Get-CIPPAzDataTableEntity @AccessGroupsTable -Filter "PartitionKey eq 'AccessRoleGroups'")
 
-        # Get the group IDs we care about
-        $RoleGroupIds = @($AccessGroups | ForEach-Object { $_.GroupId } | Where-Object { $_ })
-
-        # Build a lookup: GroupId -> Role names (a group can map to multiple roles)
-        $GroupToRoles = @{}
-        foreach ($Mapping in $AccessGroups) {
-            if ($Mapping.GroupId) {
-                if (-not $GroupToRoles.ContainsKey($Mapping.GroupId)) {
-                    $GroupToRoles[$Mapping.GroupId] = [System.Collections.Generic.List[string]]::new()
-                }
-                $GroupToRoles[$Mapping.GroupId].Add($Mapping.RowKey)
-            }
+        # Load the roles that actually exist on this instance. A mapping whose role was never
+        # migrated across (or was later deleted) leaves an orphaned auto-role that the access
+        # check cannot resolve - which locks the user out of everything, base role included.
+        # Skipping those mappings here lets the sync self-heal: because each user's auto-roles
+        # are recomputed from scratch every run, the stale role is dropped from every affected
+        # user on the next pass instead of being re-stamped forever. This mirrors the same
+        # existence guard the live path already applies in Test-CIPPAccessUserRole.
+        # $CustomRoleNames stays $null when the lookup fails so a transient storage error
+        # degrades to "prune nothing" rather than stripping every custom role from every user.
+        $BaseRoles = @('superadmin', 'admin', 'editor', 'readonly')
+        $CustomRoleNames = $null
+        try {
+            $CustomRolesTable = Get-CippTable -TableName CustomRoles
+            $CustomRoleNames = @(Get-CIPPAzDataTableEntity @CustomRolesTable -Filter "PartitionKey eq 'CustomRoles'" | ForEach-Object { $_.RowKey })
+        } catch {
+            Write-LogMessage -API $ApiName -tenant 'none' -message "User sync could not load custom roles; skipping stale-role pruning this run: $($_.Exception.Message)" -sev Warning
         }
+
+        # Build a lookup: GroupId -> Role names (a group can map to multiple roles), keeping only
+        # roles that still exist. Orphaned role names are collected so the run that prunes them
+        # can say which ones, without re-logging on every steady-state pass afterwards.
+        $GroupToRoles = @{}
+        $SkippedRoles = [System.Collections.Generic.List[string]]::new()
+        foreach ($Mapping in $AccessGroups) {
+            if (-not $Mapping.GroupId) { continue }
+            # $null CustomRoleNames means the lookup failed above - treat every role as valid.
+            $RoleExists = ($BaseRoles -contains $Mapping.RowKey) -or ($null -eq $CustomRoleNames) -or ($CustomRoleNames -contains $Mapping.RowKey)
+            if (-not $RoleExists) {
+                if ($SkippedRoles -notcontains $Mapping.RowKey) { $SkippedRoles.Add($Mapping.RowKey) }
+                continue
+            }
+            if (-not $GroupToRoles.ContainsKey($Mapping.GroupId)) {
+                $GroupToRoles[$Mapping.GroupId] = [System.Collections.Generic.List[string]]::new()
+            }
+            $GroupToRoles[$Mapping.GroupId].Add($Mapping.RowKey)
+        }
+
+        # Only fetch members of groups that still map to at least one real role
+        $RoleGroupIds = @($GroupToRoles.Keys)
 
         # Fetch members of each role group from the partner tenant
         # Use transitiveMembers to catch nested group memberships
@@ -54,6 +78,19 @@ function Start-UserSyncTimer {
                 foreach ($Member in $UserMembers) {
                     $Upn = $Member.userPrincipalName
                     if ([string]::IsNullOrWhiteSpace($Upn)) { continue }
+
+                    if ($Upn -match '#EXT#') {
+                        if (-not [string]::IsNullOrWhiteSpace($Member.mail)) {
+                            $Upn = $Member.mail
+                        } else {
+                            $Upn = ($Upn -replace '#EXT#@.+$', '') -replace '_([^_]+)$', '@$1'
+                        }
+                    }
+
+                    if ($Upn -match '[#/\\?]') {
+                        Write-LogMessage -API $ApiName -tenant 'none' -message "User sync skipped '$($Member.userPrincipalName)': could not derive a Table Storage-safe key." -sev Warning
+                        continue
+                    }
                     $Upn = $Upn.Trim().ToLower()
 
                     if (-not $UserRoleMap.ContainsKey($Upn)) {
@@ -67,12 +104,6 @@ function Start-UserSyncTimer {
                 $ErrorData = Get-CippException -Exception $_
                 Write-LogMessage -API $ApiName -tenant 'none' -message "Failed to fetch members of group $GroupId : $($ErrorData.NormalizedError)" -sev Warning -LogData $ErrorData
             }
-        }
-
-        if ($UserRoleMap.Count -eq 0 -and $RoleGroupIds.Count -gt 0) {
-            Write-LogMessage -API $ApiName -tenant 'none' -message 'No users found in any role groups.' -sev Info
-        } elseif ($RoleGroupIds.Count -eq 0) {
-            Write-LogMessage -API $ApiName -tenant 'none' -message 'No Entra groups mapped to roles — will clean up any stale auto-provisioned users.' -sev Info
         }
 
         # Load existing allowedUsers table
@@ -91,7 +122,6 @@ function Start-UserSyncTimer {
         }
 
         $Now = (Get-Date).ToUniversalTime().ToString('o')
-        $UpsertCount = 0
         $RemoveCount = 0
         $EntitiesToUpsert = [System.Collections.Generic.List[object]]::new()
         $EntitiesToRemove = [System.Collections.Generic.List[object]]::new()
@@ -134,7 +164,6 @@ function Start-UserSyncTimer {
             }
 
             $EntitiesToUpsert.Add($Entity)
-            $UpsertCount++
         }
 
         # Reconcile existing users that are NOT in any mapped role group
@@ -205,19 +234,40 @@ function Start-UserSyncTimer {
             }
         }
 
-        # Apply upserts first (write canonical rows), then removals (drop duplicates/stale rows)
+        # Apply upserts first (write canonical rows), then removals (drop duplicates/stale rows).
+        # Only count an upsert as a change when the role data actually differs from the
+        # existing canonical row — LastSync alone changing every run isn't a real change.
+        $ChangedCount = 0
         foreach ($Entity in $EntitiesToUpsert) {
+            $Canonical = $null
+            if ($ExistingLookup.ContainsKey($Entity.RowKey)) {
+                $Canonical = $ExistingLookup[$Entity.RowKey] | Where-Object { $_.RowKey -ceq $Entity.RowKey } | Select-Object -First 1
+            }
+            if (-not $Canonical -or
+                $Canonical.Roles -ne $Entity.Roles -or
+                $Canonical.AutoRoles -ne $Entity.AutoRoles -or
+                $Canonical.ManualRoles -ne $Entity.ManualRoles -or
+                $Canonical.Source -ne $Entity.Source) {
+                $ChangedCount++
+            }
             Add-CIPPAzDataTableEntity @UsersTable -Entity $Entity -Force
         }
         foreach ($Entity in $EntitiesToRemove) {
-            Remove-AzDataTableEntity -Force @UsersTable -Entity $Entity
+            Remove-CIPPAzDataTableEntity -Force @UsersTable -Entity $Entity
             $RemoveCount++
         }
 
         # Invalidate CRAFT's in-memory user cache so changes apply
         try { [Craft.Services.AuthBridge]::InvalidateUsers() } catch {}
 
-        Write-LogMessage -API $ApiName -tenant 'none' -message "User sync completed: $UpsertCount users synced, $RemoveCount duplicate/stale rows removed." -sev Info
+        # Only log when something actually changed — no noise on steady-state runs.
+        if ($ChangedCount -gt 0 -or $RemoveCount -gt 0) {
+            $Message = "User sync completed: $ChangedCount users added/updated, $RemoveCount duplicate/stale rows removed."
+            if ($SkippedRoles.Count -gt 0) {
+                $Message += " Pruned auto-role(s) with no matching definition on this instance: $($SkippedRoles -join ', ')."
+            }
+            Write-LogMessage -API $ApiName -tenant 'none' -message $Message -sev Info
+        }
 
     } catch {
         $ErrorData = Get-CippException -Exception $_

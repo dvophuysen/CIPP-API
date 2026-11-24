@@ -1,0 +1,41 @@
+function Invoke-ListDetectedAppDevices {
+    <#
+    .FUNCTIONALITY
+        Entrypoint
+    .ROLE
+        Identity.Device.Read
+    .DESCRIPTION
+        Lists Intune-managed devices that have a specific detected application installed, identified by App ID.
+    #>
+    [CmdletBinding()]
+    param($Request, $TriggerMetadata)
+
+    $TenantFilter = $Request.Query.tenantFilter
+    $AppID = $Request.Query.AppID
+
+    # Get managed devices where a specific detected app is installed
+    # Uses deviceManagement/detectedApps/{id}/managedDevices endpoint
+
+    if (-not $AppID) {
+        return ([HttpResponseContext]@{ StatusCode = [HttpStatusCode]::BadRequest; Body = @{ Results = 'AppID is required' } })
+    }
+    try {
+        $GraphRequest = New-GraphGetRequest -uri "https://graph.microsoft.com/beta/deviceManagement/detectedApps/$AppID/managedDevices" -Tenantid $TenantFilter
+
+        # Ensure we return an array even if null
+        if ($null -eq $GraphRequest) {
+            $GraphRequest = @()
+        }
+
+        $StatusCode = [HttpStatusCode]::OK
+    } catch {
+        $ErrorMessage = Get-NormalizedError -Message $_.Exception.Message
+        $StatusCode = [HttpStatusCode]::InternalServerError
+        $GraphRequest = $ErrorMessage
+    }
+
+    return [HttpResponseContext]@{
+        StatusCode = $StatusCode
+        Body       = @($GraphRequest)
+    }
+}
