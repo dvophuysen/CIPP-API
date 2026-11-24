@@ -4,6 +4,8 @@ function Invoke-ListSPOVersionCleanup {
         Entrypoint
     .ROLE
         Sharepoint.Site.Read
+    .DESCRIPTION
+        Reports the file version history cleanup status for a SharePoint site, given its SiteUrl. Shows whether a trim job is configured or running and what it has reclaimed.
     #>
     [CmdletBinding()]
     param($Request, $TriggerMetadata)
@@ -12,6 +14,9 @@ function Invoke-ListSPOVersionCleanup {
     $Headers = $Request.Headers
     $TenantFilter = $Request.Query.tenantFilter ?? $Request.Body.tenantFilter
     $SiteUrl = $Request.Query.SiteUrl ?? $Request.Body.SiteUrl
+    if (-not $SiteUrl) {
+        return ([HttpResponseContext]@{ StatusCode = [HttpStatusCode]::BadRequest; Body = @{ Results = 'SiteUrl is required' } })
+    }
 
     try {
         $Result = Get-CIPPSiteVersionCleanupStatus -TenantFilter $TenantFilter -SiteUrl $SiteUrl
